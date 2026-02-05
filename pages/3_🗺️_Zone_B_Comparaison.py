@@ -144,7 +144,7 @@ st.session_state["zone_b_selected_codes"] = set(
 )
 
 sel = sorted(st.session_state["zone_b_selected_codes"])
-st.info(f"Zone A — communes sélectionnées : **{len(sel)}**")
+st.info(f"Zone B — communes sélectionnées : **{len(sel)}**")
 
 # carte
 m = folium.Map(location=[center["lat"], center["lon"]], zoom_start=10, control_scale=True)
@@ -154,16 +154,16 @@ for _, r in in_radius.head(250).iterrows():
     folium.CircleMarker([r["lat"], r["lon"]], radius=4, tooltip=f"{r['nom']} ({r['code_insee']})").add_to(m)
 st_folium(m, width=900, height=420)
 
-# sortie DF zone A
-df_zone_a = in_radius[in_radius["code_insee"].isin(sel)].copy()
-st.session_state["zone_a"] = df_zone_a
+# sortie DF Zone B
+df_zone_b = in_radius[in_radius["code_insee"].isin(sel)].copy()
+st.session_state["zone_b"] = df_zone_b
 
-st.markdown("### DataFrame Zone A")
-st.dataframe(df_zone_a, use_container_width=True, height=260)
+st.markdown("### DataFrame Zone B")
+st.dataframe(df_zone_b, use_container_width=True, height=260)
 
 st.download_button(
-    "⬇️ Télécharger Zone A (CSV)",
-    data=df_zone_a.to_csv(index=False).encode("utf-8"),
+    "⬇️ Télécharger Zone B (CSV)",
+    data=df_zone_b.to_csv(index=False).encode("utf-8"),
     file_name="zone_b_communes.csv",
     mime="text/csv",
 )
