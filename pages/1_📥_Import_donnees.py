@@ -1,19 +1,15 @@
-import io
-import csv
-import time
+# pages/1_📥_Import_donnees.py
+import io, csv, time
 import pandas as pd
 import streamlit as st
 
-st.title("📥 Import des données (une fois)")
+st.title("📥 Import des données")
 
-# ---------- Reader robuste ----------
 @st.cache_data(show_spinner=False)
 def read_uploaded_csv_smart(file_bytes: bytes):
-    size_mb = round(len(file_bytes) / (1024 * 1024), 2)
     sample = file_bytes[:300_000].decode("utf-8", errors="replace")
     try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
-        sep = dialect.delimiter
+        sep = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"]).delimiter
     except Exception:
         sep = ";"
 
@@ -28,7 +24,6 @@ def read_uploaded_csv_smart(file_bytes: bytes):
             on_bad_lines="skip",
         )
         diag = {
-            "size_mb": size_mb,
             "sep_used": sep,
             "encoding": enc,
             "seconds": round(time.time() - t0, 2),
@@ -43,37 +38,26 @@ def read_uploaded_csv_smart(file_bytes: bytes):
     except Exception:
         return _try("latin-1")
 
+# ✅ état
+if "datasets_files" not in st.session_state:
+    st.session_state["datasets_files"] = {}  # {name: bytes}
+if "datasets_diag" not in st.session_state:
+    st.session_state["datasets_diag"] = {}   # {name: diag}
 
-# ---------- UI ----------
-st.caption("Tu peux importer plusieurs fichiers : âges, revenus, logements, entreprises, etc.")
-uploaded = st.file_uploader(
-    "Dépose tes fichiers CSV (tu peux en sélectionner plusieurs)",
-    type=["csv"],
-    accept_multiple_files=True
-)
-
-if "datasets" not in st.session_state:
-    st.session_state["datasets"] = {}
-
-datasets = st.session_state["datasets"]
+uploaded = st.file_uploader("Import CSV (multi)", type=["csv"], accept_multiple_files=True)
 
 if uploaded:
     for f in uploaded:
-        key = f.name
-        with st.spinner(f"Lecture {key}..."):
-            df, diag = read_uploaded_csv_smart(f.getvalue())
-        datasets[key] = {"df": df, "diag": diag}
-        st.success(f"Importé : {key} ({diag['rows']:,} lignes, {diag['size_mb']} Mo)")
+        b = f.getvalue()
+        st.session_state["datasets_files"][f.name] = b
+        # on calcule diag / aperçu via cache (rapide à la relance)
+        df, diag = read_uploaded_csv_smart(b)
+        st.session_state["datasets_diag"][f.name] = diag
+        st.success(f"Importé: {f.name} ({diag['rows']:,} lignes)")
 
-st.markdown("## Datasets en mémoire")
-if not datasets:
-    st.info("Aucun dataset importé pour l’instant.")
+st.markdown("## Datasets disponibles")
+if not st.session_state["datasets_files"]:
+    st.info("Aucun dataset importé.")
 else:
-    for name, obj in datasets.items():
-        st.markdown(f"### {name}")
-        st.json(obj["diag"])
-        st.dataframe(obj["df"].head(20), use_container_width=True, height=220)
-
-if st.button("🧹 Vider tous les datasets"):
-    st.session_state["datasets"] = {}
-    st.experimental_rerun()
+    for name, diag in st.session_state["datasets_diag"].items():
+        st.write(f"**{name}** — {diag['rows']:,} lignes, sep={diag['sep_used']} enc={diag['encoding']}")
