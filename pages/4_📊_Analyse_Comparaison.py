@@ -1,3 +1,6 @@
+import io
+import csv
+import time
 import re
 import numpy as np
 import pandas as pd
@@ -5,6 +8,43 @@ import streamlit as st
 
 st.set_page_config(page_title="Analyse & Comparaison", layout="wide")
 st.title("📊 Analyse & comparaison — Zone A vs Zone B")
+
+# =========================
+# CSV reader (depuis bytes importés)
+# =========================
+@st.cache_data(show_spinner=False)
+def read_uploaded_csv_smart(file_bytes: bytes):
+    sample = file_bytes[:300_000].decode("utf-8", errors="replace")
+    try:
+        sep = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"]).delimiter
+    except Exception:
+        sep = ";"
+
+    def _try(enc: str):
+        t0 = time.time()
+        df = pd.read_csv(
+            io.BytesIO(file_bytes),
+            sep=sep,
+            engine="python",
+            quotechar='"',
+            encoding=enc,
+            on_bad_lines="skip",
+        )
+        diag = {
+            "sep_used": sep,
+            "encoding": enc,
+            "seconds": round(time.time() - t0, 2),
+            "rows": int(df.shape[0]),
+            "cols": int(df.shape[1]),
+            "columns": df.columns.tolist(),
+        }
+        return df, diag
+
+    try:
+        return _try("utf-8")
+    except Exception:
+        return _try("latin-1")
+
 
 # =========================
 # Helpers (âge / buckets)
@@ -79,48 +119,32 @@ def detect_total_age_value(age_values):
 
 def pick_age_base(age_values):
     """
-    Prend une base non-recouvrante si possible :
+    Base non-recouvrante si possible :
     - priorité aux classes YxTy (souvent 5 ans)
-    - sinon prend des macro-tranches (Y_LT.., Y..T.. larges, Y_GE..)
+    - sinon fallback sur tout ce qui est parseable
     """
     vals = [str(v) for v in age_values]
     yxtys = [v for v in vals if re.fullmatch(r"Y\d{1,3}T\d{1,3}", v)]
     if len(yxtys) >= 10:
         return yxtys
 
-    # fallback macro “larges”
     parsed = []
     for v in vals:
         a, b = parse_age_macro(v)
         if a is None and b is None:
             continue
-        parsed.append((v, a, b))
+        parsed.append(v)
 
-    if not parsed:
-        return []
-
-    chosen = []
-    for v, a, b in parsed:
-        if v.startswith("Y_LT") or v.startswith("Y_GE"):
-            chosen.append(v)
-        elif b is not None and (b - a) >= 10:
-            chosen.append(v)
-
-    # si trop peu, on garde tout ce qui est parseable
-    if len(chosen) < 6:
-        chosen = [v for v, _, _ in parsed]
-
-    return sorted(list(set(chosen)))
+    return sorted(list(set(parsed)))
 
 def filter_base_dimensions(df: pd.DataFrame) -> pd.DataFrame:
     """Filtre recensement : communes + POP + total sexe (si colonnes présentes)"""
     d = df.copy()
 
-    # colonnes attendues
     needed = [c for c in ["AGE","GEO","GEO_OBJECT","RP_MEASURE","SEX","TIME_PERIOD","OBS_VALUE"] if c in d.columns]
     d = d[needed].copy()
 
-    if "GEO" not in d.columns or "AGE" not in d.columns or "TIME_PERIOD" not in d.columns or "OBS_VALUE" not in d.columns:
+    if not {"AGE","GEO","TIME_PERIOD","OBS_VALUE"}.issubset(set(d.columns)):
         return pd.DataFrame()
 
     d["GEO"] = d["GEO"].astype(str).str.zfill(5)
@@ -134,35 +158,29 @@ def filter_base_dimensions(df: pd.DataFrame) -> pd.DataFrame:
         d = d[d["RP_MEASURE"].astype(str).str.upper().eq("POP")].copy()
 
     if "SEX" in d.columns:
-        # typique : "_T"
         d = d[d["SEX"].astype(str).isin(["_T","T","TOTAL"])].copy()
 
     d["OBS_VALUE"] = safe_int_series(d["OBS_VALUE"])
     return d
 
 def zone_total_population_by_year(df_zone: pd.DataFrame, total_age_value, age_base_for_sum):
-    """Total zone par année : priorité AGE total sinon somme base non recouvrante"""
     d = df_zone.copy()
+
     if total_age_value is not None:
         dd = d[d["AGE"] == str(total_age_value)]
         if not dd.empty:
             s = dd.groupby("TIME_PERIOD")["OBS_VALUE"].sum()
-            s = s.loc[sort_years(s.index.tolist())]
-            return s.astype(int)
+            return s.loc[sort_years(s.index.tolist())].astype(int)
 
     if age_base_for_sum:
         dd = d[d["AGE"].isin(age_base_for_sum)]
         s = dd.groupby("TIME_PERIOD")["OBS_VALUE"].sum()
-        s = s.loc[sort_years(s.index.tolist())]
-        return s.astype(int)
+        return s.loc[sort_years(s.index.tolist())].astype(int)
 
-    # dernier recours
     s = d.groupby("TIME_PERIOD")["OBS_VALUE"].sum()
-    s = s.loc[sort_years(s.index.tolist())]
-    return s.astype(int)
+    return s.loc[sort_years(s.index.tolist())].astype(int)
 
 def zone_age_buckets_by_year(df_zone: pd.DataFrame, age_base):
-    """Aire empilée par buckets (0-14, 15-29, ...)"""
     if not age_base:
         return pd.DataFrame()
 
@@ -170,7 +188,6 @@ def zone_age_buckets_by_year(df_zone: pd.DataFrame, age_base):
     if d.empty:
         return pd.DataFrame()
 
-    # AGE -> bucket
     map_bucket = {}
     for a in d["AGE"].unique().tolist():
         amin, amax = parse_age_macro(a)
@@ -188,13 +205,15 @@ def zone_age_buckets_by_year(df_zone: pd.DataFrame, age_base):
 
 
 # =========================
-# Récupération état global
+# Récupération état global (NOUVEAU)
 # =========================
-datasets = st.session_state.get("datasets", {})
+datasets_files = st.session_state.get("datasets_files", {})
+datasets_diag  = st.session_state.get("datasets_diag", {})
+
 zone_a = st.session_state.get("zone_a", None)
 zone_b = st.session_state.get("zone_b", None)
 
-if not datasets:
+if not datasets_files:
     st.error("Aucun dataset importé. Va sur la page **📥 Import données**.")
     st.stop()
 
@@ -202,50 +221,26 @@ if zone_a is None or len(zone_a) == 0:
     st.error("Zone A non définie. Va sur la page **🗺️ Zone A**.")
     st.stop()
 
-# Zone B optionnelle
 use_zone_b = (zone_b is not None and len(zone_b) > 0)
 codes_a = zone_a["code_insee"].astype(str).tolist()
 codes_b = zone_b["code_insee"].astype(str).tolist() if use_zone_b else []
 
-st.caption(f"Zone A: {len(codes_a)} communes" + (f" | Zone B: {len(codes_b)} communes" if use_zone_b else " | Zone B: non définie"))
+st.caption(
+    f"Zone A: {len(codes_a)} communes"
+    + (f" | Zone B: {len(codes_b)} communes" if use_zone_b else " | Zone B: non définie")
+)
+
+names = sorted(list(datasets_files.keys()))
 
 # =========================
-# Sélection des datasets
+# Sidebar: choix dataset âges + optionnels
 # =========================
-def guess_age_dataset_name(datasets_dict):
-    for name, obj in datasets_dict.items():
-        df = obj["df"]
-        cols = set([c.upper() for c in df.columns])
-        if {"AGE","GEO","TIME_PERIOD","OBS_VALUE"}.issubset(cols):
-            return name
-    return None
-
-def guess_revenue_dataset_name(datasets_dict):
-    # heuristique grossière : présence de "revenu" / "median" / "nivvie"
-    for name, obj in datasets_dict.items():
-        cols = " ".join([c.lower() for c in obj["df"].columns])
-        if ("revenu" in cols) or ("niv" in cols and "vie" in cols) or ("median" in cols and "uc" in cols):
-            return name
-    return None
-
-def guess_comp_dataset_name(datasets_dict):
-    for name, obj in datasets_dict.items():
-        cols = " ".join([c.lower() for c in obj["df"].columns])
-        if ("naf" in cols) or ("ape" in cols) or ("concurr" in cols) or ("etabl" in cols) or ("siret" in cols):
-            return name
-    return None
-
-age_guess = guess_age_dataset_name(datasets)
-rev_guess = guess_revenue_dataset_name(datasets)
-comp_guess = guess_comp_dataset_name(datasets)
-
-names = list(datasets.keys())
-
 with st.sidebar:
     st.header("Données utilisées")
-    age_ds_name = st.selectbox("Dataset Population/Ages (INSEE)", options=names, index=(names.index(age_guess) if age_guess in names else 0))
-    rev_ds_name = st.selectbox("Dataset Revenus (optionnel)", options=["(Aucun)"] + names, index=(1 + names.index(rev_guess) if rev_guess in names else 0))
-    comp_ds_name = st.selectbox("Dataset Concurrence (optionnel)", options=["(Aucun)"] + names, index=(1 + names.index(comp_guess) if comp_guess in names else 0))
+
+    age_ds_name = st.selectbox("Dataset Population/Ages (INSEE)", options=names, index=0)
+    rev_ds_name = st.selectbox("Dataset Revenus (optionnel)", options=["(Aucun)"] + names, index=0)
+    comp_ds_name = st.selectbox("Dataset Concurrence (optionnel)", options=["(Aucun)"] + names, index=0)
 
     st.divider()
     st.header("Scoring (optionnel)")
@@ -254,24 +249,22 @@ with st.sidebar:
     w_acc = st.slider("Poids accessibilité (proxy densité)", 0, 70, 20, 5)
     w_comp = st.slider("Poids concurrence", 0, 70, 15, 5)
 
-# normaliser poids
 w_sum = w_age + w_rev + w_acc + w_comp
 if w_sum == 0:
-    w_age = 40; w_rev = 25; w_acc = 20; w_comp = 15
+    w_age, w_rev, w_acc, w_comp = 40, 25, 20, 15
     w_sum = 100
-
 W = {"age": w_age / w_sum, "rev": w_rev / w_sum, "acc": w_acc / w_sum, "comp": w_comp / w_sum}
 
 
 # =========================
-# 1) Population totale par année — A vs B
+# Load DATASET AGE
 # =========================
-st.markdown("## 1) Population totale (zone) — par année")
+with st.spinner(f"Chargement dataset âges: {age_ds_name} ..."):
+    df_age_raw, diag_age = read_uploaded_csv_smart(datasets_files[age_ds_name])
 
-df_age_raw = datasets[age_ds_name]["df"]
 df_age = filter_base_dimensions(df_age_raw)
 if df_age.empty:
-    st.error("Le dataset sélectionné ne ressemble pas à un fichier INSEE AGE/GEO/TIME_PERIOD/OBS_VALUE exploitable.")
+    st.error("Le dataset sélectionné ne ressemble pas à un fichier INSEE exploitable (AGE/GEO/TIME_PERIOD/OBS_VALUE).")
     st.stop()
 
 dfA = df_age[df_age["GEO"].isin(codes_a)].copy()
@@ -281,24 +274,32 @@ age_values_A = sorted(dfA["AGE"].unique().tolist())
 total_age_auto = detect_total_age_value(age_values_A)
 age_base_auto = pick_age_base(age_values_A)
 
-c1, c2 = st.columns([0.6, 0.4], gap="large")
+# =========================
+# 1) Population totale par année — A vs B
+# =========================
+st.markdown("## 1) Population totale (zone) — par année")
+
+c1, c2 = st.columns([0.62, 0.38], gap="large")
 with c2:
     st.caption("Réglages anti-doublons")
     total_age_choice = st.selectbox("AGE total (Zone A)", options=["(Auto)"] + age_values_A, index=0)
+
     age_base_mode = st.radio("Base tranches", ["Auto", "Manuel"], index=0, horizontal=True)
     if age_base_mode == "Manuel":
-        age_base_manual = st.multiselect("Modalités AGE pour tranches", options=age_values_A, default=age_base_auto[:min(30, len(age_base_auto))])
-        age_base = age_base_manual
+        age_base = st.multiselect(
+            "Modalités AGE pour tranches",
+            options=age_values_A,
+            default=age_base_auto[: min(30, len(age_base_auto))],
+        )
     else:
         age_base = age_base_auto
 
 total_age_value = total_age_auto if total_age_choice == "(Auto)" else total_age_choice
 
 popA = zone_total_population_by_year(dfA, total_age_value, age_base)
-pop_df = pd.DataFrame({"annee": popA.index, "Zone A": popA.values})
+pop_df = pd.DataFrame({"annee": popA.index.astype(str), "Zone A": popA.values})
 
 if use_zone_b:
-    # pour B, on applique la même règle (AGE total choisi) — ça reste cohérent
     popB = zone_total_population_by_year(dfB, total_age_value, age_base)
     pop_df["Zone B"] = popB.reindex(popA.index).fillna(0).astype(int).values
 
@@ -315,11 +316,10 @@ with c1:
 st.markdown("## 2) Tranches d’âge (zone) — évolution")
 
 bucketA = zone_age_buckets_by_year(dfA, age_base)
-
 if bucketA.empty:
     st.warning(
         "Impossible de construire des tranches d’âge avec la base actuelle.\n"
-        "👉 Passe en **Base tranches = Manuel** et sélectionne les modalités AGE qui sont vraiment des tranches."
+        "👉 Passe en **Base tranches = Manuel** et sélectionne uniquement des modalités AGE qui sont de vraies tranches."
     )
     st.stop()
 
@@ -327,31 +327,30 @@ st.subheader("Zone A")
 st.dataframe(bucketA.reset_index().rename(columns={"TIME_PERIOD": "annee"}), use_container_width=True, height=240)
 st.area_chart(bucketA, use_container_width=True)
 
+bucketB = None
 if use_zone_b:
     bucketB = zone_age_buckets_by_year(dfB, age_base)
     st.subheader("Zone B")
     st.dataframe(bucketB.reset_index().rename(columns={"TIME_PERIOD": "annee"}), use_container_width=True, height=240)
     st.area_chart(bucketB, use_container_width=True)
 else:
-    bucketB = None
     st.info("Zone B non définie : la comparaison tranches d’âge est affichée uniquement pour Zone A.")
 
 
 # =========================
-# 3) Synthèse comparée (dernière année) + indices
+# 3) Synthèse (dernière année) + indices
 # =========================
 st.markdown("## 3) Synthèse comparée (dernière année) — indices base 100")
 
-latest_year = pop_df["annee"].astype(str).max()
+latest_year = str(pop_df["annee"].max())
 st.caption(f"Dernière année utilisée : {latest_year}")
 
 def latest_bucket_share(bucket_pivot: pd.DataFrame) -> pd.Series:
     if bucket_pivot is None or bucket_pivot.empty:
         return pd.Series(dtype=float)
-    yr = str(latest_year)
-    if yr not in bucket_pivot.index.astype(str):
+    if latest_year not in bucket_pivot.index.astype(str):
         return pd.Series(dtype=float)
-    row = bucket_pivot.loc[yr].astype(float)
+    row = bucket_pivot.loc[latest_year].astype(float)
     tot = float(row.sum()) if row.sum() != 0 else 1.0
     return (row / tot) * 100.0
 
@@ -361,7 +360,6 @@ shareB = latest_bucket_share(bucketB).rename("Zone B (%)") if use_zone_b else pd
 synth = pd.concat([shareA, shareB], axis=1)
 st.dataframe(synth, use_container_width=True)
 
-# indices âge : on prend "60-74 + 75+" comme proxy audition (modulable)
 def age_index_from_shares(shares: pd.Series) -> float:
     if shares.empty:
         return 100.0
@@ -370,17 +368,18 @@ def age_index_from_shares(shares: pd.Series) -> float:
 age_idx_A = age_index_from_shares(shareA)
 age_idx_B = age_index_from_shares(shareB) if use_zone_b else np.nan
 
+
 # =========================
 # 4) Revenus (optionnel)
 # =========================
-rev_idx_A = 100.0
 rev_idx_B = np.nan
+rev_idx_A = 100.0
 
 if rev_ds_name != "(Aucun)":
-    df_rev = datasets[rev_ds_name]["df"].copy()
-    st.markdown("### Revenus (optionnel) — mapping colonnes")
+    with st.spinner(f"Chargement revenus: {rev_ds_name} ..."):
+        df_rev, _ = read_uploaded_csv_smart(datasets_files[rev_ds_name])
 
-    # mapping colonne code insee + valeur revenu
+    st.markdown("### Revenus (optionnel) — mapping colonnes")
     cols = df_rev.columns.tolist()
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -393,6 +392,9 @@ if rev_ds_name != "(Aucun)":
     df_rev["code_insee"] = df_rev[rev_col_geo].astype(str).str.zfill(5)
     df_rev["value"] = pd.to_numeric(df_rev[rev_col_value], errors="coerce")
 
+    zA = df_rev[df_rev["code_insee"].isin(codes_a)]["value"].dropna()
+    refA = float(zA.median()) if (not zA.empty and rev_agg == "médiane") else (float(zA.mean()) if not zA.empty else np.nan)
+
     def zone_rev_index(codes, reference_value):
         z = df_rev[df_rev["code_insee"].isin(codes)]["value"].dropna()
         if z.empty or reference_value is None or np.isnan(reference_value) or reference_value == 0:
@@ -401,14 +403,10 @@ if rev_ds_name != "(Aucun)":
         idx = 100.0 * (val / reference_value)
         return val, idx
 
-    # référence = Zone A (défendable et simple)
-    zA = df_rev[df_rev["code_insee"].isin(codes_a)]["value"].dropna()
-    refA = float(zA.median()) if (not zA.empty and rev_agg == "médiane") else (float(zA.mean()) if not zA.empty else np.nan)
-
-    rev_val_A, rev_idx_A = zone_rev_index(codes_a, refA)
+    rev_val_A, _ = zone_rev_index(codes_a, refA)
     rev_val_B, rev_idx_B = zone_rev_index(codes_b, refA) if use_zone_b else (np.nan, np.nan)
 
-    st.write(f"Revenu Zone A (référence 100) : {rev_val_A:.2f} → indice {rev_idx_A:.1f}" if not np.isnan(rev_val_A) else "Revenus Zone A non calculables")
+    st.write(f"Revenu Zone A (référence 100) : {rev_val_A:.2f}" if not np.isnan(rev_val_A) else "Revenus Zone A non calculables")
     if use_zone_b:
         st.write(f"Revenu Zone B : {rev_val_B:.2f} → indice {rev_idx_B:.1f}" if not np.isnan(rev_val_B) else "Revenus Zone B non calculables")
 
@@ -420,9 +418,10 @@ comp_idx_A = 100.0
 comp_idx_B = np.nan
 
 if comp_ds_name != "(Aucun)":
-    df_comp = datasets[comp_ds_name]["df"].copy()
-    st.markdown("### Concurrence (optionnel) — mapping colonnes")
+    with st.spinner(f"Chargement concurrence: {comp_ds_name} ..."):
+        df_comp, _ = read_uploaded_csv_smart(datasets_files[comp_ds_name])
 
+    st.markdown("### Concurrence (optionnel) — mapping colonnes")
     cols = df_comp.columns.tolist()
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -441,18 +440,11 @@ if comp_ds_name != "(Aucun)":
     compA = zone_comp_metric(codes_a)
     compB = zone_comp_metric(codes_b) if use_zone_b else np.nan
 
-    # référence = Zone A
-    if compA == 0:
-        comp_idx_A = 100.0
-        comp_idx_B = np.nan
-    else:
+    if compA != 0 and use_zone_b and compB != 0:
         if comp_mode == "moins = mieux":
-            # moins de concurrence => indice > 100 si B a moins de concurrence
-            comp_idx_A = 100.0
-            comp_idx_B = 100.0 * (compA / compB) if (use_zone_b and compB and compB != 0) else np.nan
+            comp_idx_B = 100.0 * (compA / compB)
         else:
-            comp_idx_A = 100.0
-            comp_idx_B = 100.0 * (compB / compA) if use_zone_b else np.nan
+            comp_idx_B = 100.0 * (compB / compA)
 
     st.write(f"Concurrents Zone A : {compA:.0f} (référence 100)")
     if use_zone_b:
@@ -460,36 +452,27 @@ if comp_ds_name != "(Aucun)":
 
 
 # =========================
-# 6) Scoring (simple, défendable)
+# 6) Scoring (défendable)
 # =========================
 st.markdown("## 4) Scoring synthétique (comparaison)")
 
-# Accessibilité proxy: ici on prend densité proxy = population / nb communes (faute de surface)
-# (quand tu auras surfaces/isochrones, on remplacera)
-acc_idx_A = 100.0
-acc_idx_B = np.nan
-
-# proxy “accessibilité” : population totale dernière année / nb communes
+# access proxy : pop dernière année / nb communes (faute de surface)
 def acc_proxy(pop_series: pd.Series, n_communes: int) -> float:
     if pop_series.empty or n_communes == 0:
         return np.nan
-    last = int(pop_series.loc[str(latest_year)]) if str(latest_year) in pop_series.index.astype(str) else int(pop_series.iloc[-1])
+    if latest_year in pop_series.index.astype(str):
+        last = int(pop_series.loc[latest_year])
+    else:
+        last = int(pop_series.iloc[-1])
     return last / n_communes
 
 accA = acc_proxy(popA, len(codes_a))
 accB = acc_proxy(popB, len(codes_b)) if use_zone_b else np.nan
-acc_idx_A = 100.0
-acc_idx_B = 100.0 * (accB / accA) if (use_zone_b and accA and not np.isnan(accB)) else np.nan
 
-# Indice âge : référence Zone A = 100
-age_idx_ref_A = 100.0
+acc_idx_B = 100.0 * (accB / accA) if (use_zone_b and accA and not np.isnan(accB)) else np.nan
 age_idx_ref_B = 100.0 * (age_idx_B / age_idx_A) if (use_zone_b and age_idx_A and not np.isnan(age_idx_B)) else np.nan
 
-# Revenus/Concurrence déjà base ZoneA=100 via indices calculés (rev_idx_A=100 par design)
-rev_idx_ref_A = 100.0
 rev_idx_ref_B = rev_idx_B
-
-comp_idx_ref_A = 100.0
 comp_idx_ref_B = comp_idx_B
 
 def score(idx_age, idx_rev, idx_acc, idx_comp):
@@ -498,20 +481,22 @@ def score(idx_age, idx_rev, idx_acc, idx_comp):
 scoreA = score(100.0, 100.0, 100.0, 100.0)
 scoreB = score(age_idx_ref_B, rev_idx_ref_B, acc_idx_B, comp_idx_ref_B) if use_zone_b else np.nan
 
-score_table = pd.DataFrame([
+rows = [
     {"Zone": "Zone A", "Indice âge": 100.0, "Indice revenu": 100.0, "Indice accessibilité": 100.0, "Indice concurrence": 100.0, "Score": scoreA},
-] + ([
-    {"Zone": "Zone B", "Indice âge": age_idx_ref_B, "Indice revenu": rev_idx_ref_B, "Indice accessibilité": acc_idx_B, "Indice concurrence": comp_idx_ref_B, "Score": scoreB},
-] if use_zone_b else []))
+]
+if use_zone_b:
+    rows.append(
+        {"Zone": "Zone B", "Indice âge": age_idx_ref_B, "Indice revenu": rev_idx_ref_B, "Indice accessibilité": acc_idx_B, "Indice concurrence": comp_idx_ref_B, "Score": scoreB}
+    )
 
+score_table = pd.DataFrame(rows)
 st.dataframe(score_table, use_container_width=True)
 
 if use_zone_b:
-    # Barres empilées (contributions)
     contrib = pd.DataFrame([
         {"Zone":"Zone A", "Âge": W["age"]*100, "Revenu": W["rev"]*100, "Accessibilité": W["acc"]*100, "Concurrence": W["comp"]*100},
         {"Zone":"Zone B",
-         "Âge": W["age"]*age_idx_ref_B,
+         "Âge": W["age"]*age_idx_ref_B if not np.isnan(age_idx_ref_B) else 0,
          "Revenu": W["rev"]*rev_idx_ref_B if not np.isnan(rev_idx_ref_B) else 0,
          "Accessibilité": W["acc"]*acc_idx_B if not np.isnan(acc_idx_B) else 0,
          "Concurrence": W["comp"]*comp_idx_ref_B if not np.isnan(comp_idx_ref_B) else 0},
